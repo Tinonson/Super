@@ -221,3 +221,160 @@ Repeat bind tests and confirm both nodes can again serve traffic.
   - HA pair support and cleaner failover behavior
 - Keep certificates and cipher policies aligned across all DCs.
 - Document break-glass method to bypass VIP and target a specific DC directly.
+
+---
+
+## 9) Second lab version: Dedicated HAProxy for LDAPS
+
+This version replaces Windows NLB with a dedicated HAProxy host running TCP pass-through for LDAPS.
+
+### 9.1 Topology (HAProxy variant)
+
+| Host | Role | Example IP |
+|---|---|---|
+| DC1 | AD DS + DNS + LDAPS backend | 10.10.10.11 |
+| DC2 | AD DS + DNS + LDAPS backend | 10.10.10.12 |
+| HAPROXY1 | Dedicated load balancer | 10.10.10.21 |
+| CLIENT1 | Domain-joined test client | 10.10.10.50 |
+
+DNS/FQDN examples:
+- AD domain: `lab.local`
+- HAProxy LDAPS name: `ldaps-haproxy.lab.local`
+- DNS A record: `ldaps-haproxy.lab.local` -> `10.10.10.21`
+
+### 9.2 Prerequisites (HAProxy variant)
+
+1. Complete sections **2** and **3** so LDAPS is healthy on each DC first.
+2. Deploy a Linux VM for HAProxy (Ubuntu Server 22.04 LTS example).
+3. Allow network flows:
+   - CLIENT1 -> HAPROXY1 TCP/636
+   - HAPROXY1 -> DC1,DC2 TCP/636
+4. Ensure CLIENT1 trusts the issuing CA chain for DC certificates.
+
+### 9.3 Install HAProxy (on HAPROXY1)
+
+```bash
+sudo apt update
+sudo apt install -y haproxy
+```
+
+### 9.4 Configure HAProxy for LDAPS pass-through
+
+Edit `/etc/haproxy/haproxy.cfg` and add/update:
+
+```haproxy
+global
+    log /dev/log local0
+    maxconn 4096
+
+defaults
+    log global
+    mode tcp
+    option tcplog
+    timeout connect 5s
+    timeout client  60s
+    timeout server  60s
+
+frontend ldaps_in
+    bind 10.10.10.21:636
+    default_backend ldaps_backends
+
+backend ldaps_backends
+    balance roundrobin
+    option tcp-check
+    default-server inter 3s fall 3 rise 2
+    server dc1 10.10.10.11:636 check
+    server dc2 10.10.10.12:636 check
+```
+
+Validate and restart:
+
+```bash
+sudo haproxy -c -f /etc/haproxy/haproxy.cfg
+sudo systemctl restart haproxy
+sudo systemctl enable haproxy
+sudo systemctl status haproxy --no-pager
+```
+
+Optional listener check:
+
+```bash
+sudo ss -lntp | rg ":636"
+```
+
+### 9.5 HAProxy test lab steps (end-to-end)
+
+Run these from CLIENT1.
+
+#### Step 1: Basic connectivity to HAProxy LDAPS endpoint
+
+```powershell
+Test-NetConnection ldaps-haproxy.lab.local -Port 636
+```
+
+Expected: `TcpTestSucceeded : True`
+
+#### Step 2: TLS handshake through HAProxy
+
+```powershell
+openssl s_client -connect ldaps-haproxy.lab.local:636 -showcerts
+```
+
+Expected:
+- TLS handshake succeeds end-to-end.
+- Presented cert is from DC1 or DC2.
+- Certificate chain validates to trusted CA.
+
+#### Step 3: LDAP bind and query test
+
+Use `ldp.exe`:
+1. **Connection > Connect**
+   - Server: `ldaps-haproxy.lab.local`
+   - Port: `636`
+   - Check **SSL**
+2. **Connection > Bind** with test user.
+3. Run a base DN search.
+
+Expected: successful bind and search results.
+
+#### Step 4: Load-balancing observation
+
+Generate repeated client connections:
+
+```powershell
+1..30 | ForEach-Object {
+  Test-NetConnection ldaps-haproxy.lab.local -Port 636 | Out-Null
+}
+```
+
+On HAPROXY1, review logs/counters to confirm both DC backends are used.
+
+#### Step 5: Backend failover test
+
+Temporarily remove DC1 service (choose one):
+- Stop AD DS service on DC1, or
+- Block TCP/636 from HAPROXY1 to DC1 with a temporary firewall rule
+
+Repeat Step 1 and Step 3 from CLIENT1.
+
+Expected: LDAPS remains available through DC2.
+
+#### Step 6: Backend recovery test
+
+Restore DC1 service/connectivity and rerun bind tests; verify both backends return to healthy state.
+
+### 9.6 Optional HAProxy stats endpoint (lab visibility)
+
+For easier backend visibility, add a stats listener (restrict by firewall/source IP):
+
+```haproxy
+listen stats
+    bind 10.10.10.21:8404
+    mode http
+    stats enable
+    stats uri /stats
+    stats refresh 10s
+```
+
+Then restart HAProxy and browse:
+- `http://10.10.10.21:8404/stats`
